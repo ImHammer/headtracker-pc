@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>VR Head Tracking</title>
+    <style>
+        body { margin: 0; }
+        canvas { display: block; }
+        #orientationChart { position: absolute; top: 10px; left: 10px; }
+    </style>
+</head>
+<body>
+    <canvas id="orientationChart" width="400" height="200"></canvas>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <script>
+        // Configura a cena
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Adiciona uma esfera 360°
+        const sphereGeometry = new THREE.SphereGeometry(50, 32, 32);
+        const texture = new THREE.TextureLoader().load('https://i.imgur.com/K6m7Ntm.jpg');
+        const sphereMaterial = new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide });
+        const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+        scene.add(sphere);
+        camera.position.set(0, 0, 0);
+
+        // Filtro de Kalman
+        const kalmanYaw = new KalmanFilter();
+        const kalmanPitch = new KalmanFilter(pitchMode = true);
+        const kalmanRoll = new KalmanFilter();
+
+        // Buffer para suavização
+        const pitchBuffer = [];
+        const maxBufferSize = 5;
+
+        // Configura o gráfico
+        // const ctx = document.getElementById('orientationChart').getContext('2d');
+        // const chart = new Chart(ctx, {
+        //     type: 'line',
+        //     data: {
+        //         labels: [],
+        //         datasets: [
+        //             { label: 'Yaw', data: [], borderColor: '#ff6384', fill: false },
+        //             { label: 'Pitch', data: [], borderColor: '#36a2eb', fill: false },
+        //             { label: 'Roll', data: [], borderColor: '#cc65fe', fill: false }
+        //         ]
+        //     },
+        //     options: {
+        //         scales: {
+        //             x: { title: { display: true, text: 'Time' } },
+        //             y: { title: { display: true, text: 'Angle (degrees)' } }
+        //         }
+        //     }
+        // });
+
+        // function updateChart(yaw, pitch, roll) {
+        //     chart.data.labels.push(new Date().toLocaleTimeString());
+        //     chart.data.datasets[0].data.push(yaw);
+        //     chart.data.datasets[1].data.push(pitch);
+        //     chart.data.datasets[2].data.push(roll);
+        //     if (chart.data.labels.length > 50) {
+        //         chart.data.labels.shift();
+        //         chart.data.datasets.forEach(dataset => dataset.data.shift());
+        //     }
+        //     chart.update();
+        // }
+
+        // Conecta ao WebSocket
+        const ws = new WebSocket('ws://192.168.1.110:8765');
+
+        ws.onopen = () => console.log('Conectado ao WebSocket');
+
+        ws.onmessage = (event) => {
+            try {
+                const data = event.data.split(';');
+                const yaw = parseFloat(data[0]);
+                let pitch = parseFloat(data[1]);
+                const roll = parseFloat(data[2]);
+
+                if (isNaN(pitch) || Math.abs(pitch) > 90) {
+                    console.warn(`Pitch inválido: ${pitch}`);
+                    return;
+                }
+
+                pitchBuffer.push(pitch);
+                if (pitchBuffer.length > maxBufferSize) pitchBuffer.shift();
+                const avgPitch = pitchBuffer.reduce((a, b) => a + b, 0) / pitchBuffer.length;
+
+                const filteredYaw = kalmanYaw.update(yaw, 0.016);
+                const filteredPitch = kalmanPitch.update(avgPitch, 0.016);
+                const filteredRoll = kalmanRoll.update(roll, 0.016);
+
+                // Reset com valor atual real
+                if (Math.abs(filteredPitch) > 89) {
+                    kalmanPitch.state = avgPitch;
+                    kalmanPitch.p = 0.5;
+                    console.warn(`Pitch recalibrado: ${avgPitch}`);
+                }
+
+                // Converte para radianos (sem inversão)
+                const yawRad = -filteredYaw * Math.PI / 180;
+                const pitchRad = filteredPitch * Math.PI / 180;
+                // const rollRad = filteredRoll * Math.PI / 180;
+                const rollRad = -(Math.abs(filteredRoll) < 1 ? 0 : filteredRoll * Math.PI / 180);
+
+                // Usa quaternion para aplicar a rotação
+                const quaternion = new THREE.Quaternion()
+                    .setFromEuler(new THREE.Euler(pitchRad, yawRad, rollRad, 'YXZ'));
+                camera.quaternion.copy(quaternion);
+
+                // updateChart(filteredYaw, filteredPitch, filteredRoll);
+                console.log(`Filtrado: yaw=${filteredYaw.toFixed(2)}, pitch=${filteredPitch.toFixed(2)}, roll=${filteredRoll.toFixed(2)}`);
+            } catch (e) {
+                console.error('Erro ao processar WebSocket:', e);
+            }
+        };
+
+        ws.onclose = () => console.log('WebSocket desconectado');
+        ws.onerror = (error) => console.error('Erro WebSocket:', error);
+
+        // Animação
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Redimensiona
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        let lastTime = 0;
+        ws.onmessage = (event) => {
+            const now = performance.now();
+            console.log(`Intervalo entre mensagens: ${now - lastTime}ms`);
+            lastTime = now;
+            // ... resto do código
+        };
+
+        // Filtro de Kalman 1D (sem velocity)
+        function KalmanFilter(pitchMode = false) {
+            this.state = 0;
+            this.p = 1.0;
+            this.q = pitchMode ? 0.0001 : 0.001; // Baixa incerteza
+            this.r = pitchMode ? 1.0 : 1.0; // Mais peso na medição
+
+            this.update = function(measurement, dt) {
+                // Predição (sem velocity)
+                this.p += this.q;
+
+                // Atualização
+                const k = this.p / (this.p + this.r);
+                this.state += k * (measurement - this.state);
+                this.p = (1 - k) * this.p;
+
+                return this.state;
+            };
+        }
+    </script>
+</body>
+</html>
